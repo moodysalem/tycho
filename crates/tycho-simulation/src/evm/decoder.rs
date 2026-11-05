@@ -1117,7 +1117,8 @@ where
     ///
     /// # Parameters
     /// * `pending_deltas` — map from extractor name to the `BlockAggregatedChanges` produced by the
-    ///   corresponding `TxDeltaIndexer::generate_deltas()` call.
+    ///   corresponding `TxDeltaIndexer::generate_deltas()` call. The name must be the protocol
+    ///   system of the extractor's pools: its account deltas reach only pools of that system.
     /// * `header` — the target block header. Its `block_number_or_timestamp()` is stamped on the
     ///   returned [`Update`]; its `block_number` and `block_timestamp` are injected into each state
     ///   delta so that protocols relying on block context (e.g. aerodrome slipstreams, etherfi)
@@ -1135,14 +1136,13 @@ where
 
         let mut updated_states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
         let mut extractors = Vec::with_capacity(pending_deltas.len());
-        for deltas in pending_deltas.values() {
-            extractors.push((deltas, Self::pending_balances(deltas)));
+        for (extractor, deltas) in pending_deltas {
+            extractors.push((extractor, deltas, Self::pending_balances(deltas)));
         }
 
-        // Every extractor's state deltas go first. A pool behind an account another extractor
-        // wrote would otherwise be rebuilt from confirmed state before its own delta arrived,
-        // whenever the map happened to yield that other extractor first.
-        for (deltas, all_balances) in &extractors {
+        // Every extractor's state deltas go first, so a pool's overrides land on the state its
+        // own delta built.
+        for (_, deltas, all_balances) in &extractors {
             for (id, state_delta) in &deltas.state_deltas {
                 let dto_delta = Self::add_block_info_to_delta(
                     ProtocolStateDelta::from(state_delta.clone()),
@@ -1159,9 +1159,10 @@ where
                 }
             }
         }
-        for (deltas, all_balances) in &extractors {
+        for (extractor, deltas, all_balances) in &extractors {
             if !deltas.account_deltas.is_empty() {
                 Self::apply_pending_overrides(
+                    extractor,
                     deltas,
                     current_block.as_ref(),
                     &mut updated_states,
@@ -1198,26 +1199,39 @@ where
         Balances { component_balances, account_balances: HashMap::new() }
     }
 
-    /// Sets the pending block's account deltas as overrides on every pool linked to a written
-    /// account.
+    /// Sets one extractor's account deltas as overrides on that extractor's pools linked to a
+    /// written account.
     ///
     /// A hooked pool prices from its hook's storage, which only the account deltas carry. An
     /// override for an account a hook never reads is inert.
+    ///
+    /// Pools of other protocols are left alone, even when linked to the same account, a token
+    /// say. Their own indexer emits the accounts they read, and a pool holds one override set:
+    /// taking another extractor's set would replace its own. Linking such a pool would also
+    /// rebuild it with an empty delta, which for a pool that re-reads confirmed state on every
+    /// transition costs a full fetch for nothing.
     ///
     /// # Errors
     /// Fails when a pool rejects the overrides' type, since its quotes would silently run
     /// against confirmed state.
     fn apply_pending_overrides(
+        extractor: &str,
         deltas: &BlockAggregatedChanges,
         current_block: Option<&BlockHeader>,
         updated_states: &mut HashMap<String, Box<dyn ProtocolSim>>,
         state_guard: &RwLockReadGuard<'_, DecoderState>,
         all_balances: &Balances,
     ) -> Result<(), StreamDecodeError> {
+        let own_pool = |id: &&String| {
+            state_guard
+                .components
+                .get(*id)
+                .is_some_and(|component| component.protocol_system == extractor)
+        };
         let mut linked_pools: HashSet<&String> = HashSet::new();
         for account in deltas.account_deltas.keys() {
             if let Some(pools) = state_guard.contracts_map.get(account) {
-                linked_pools.extend(pools);
+                linked_pools.extend(pools.iter().filter(own_pool));
             }
         }
 
@@ -1954,6 +1968,11 @@ mod tests {
             state
                 .contracts_map
                 .insert(hook.clone(), HashSet::from([pool_id.clone(), quiet_pool_id.clone()]));
+            for id in [&pool_id, &quiet_pool_id] {
+                state
+                    .components
+                    .insert(id.clone(), component_of(id, "uniswap_v4_hooks"));
+            }
         }
 
         let deltas = BlockAggregatedChanges {
@@ -2024,13 +2043,45 @@ mod tests {
         }
     }
 
-    /// A pool with a pending state delta takes only that delta, whichever order the extractors
-    /// arrive in, even when other extractors wrote an account linked to it.
+    /// A decoder component of `protocol_system`, for linking tests.
+    fn component_of(id: &str, protocol_system: &str) -> ProtocolComponent {
+        ProtocolComponent::new(
+            Bytes::from(id.as_bytes().to_vec()),
+            protocol_system.to_string(),
+            "test".to_string(),
+            Chain::Ethereum,
+            vec![],
+            vec![],
+            HashMap::new(),
+            Bytes::default(),
+            chrono::NaiveDateTime::default(),
+        )
+    }
+
+    fn shared_account_write(
+        shared: &Bytes,
+    ) -> HashMap<Bytes, tycho_common::models::contract::AccountDelta> {
+        use tycho_common::models::{contract::AccountDelta, ChangeType as ModelChangeType};
+
+        HashMap::from([(
+            shared.clone(),
+            AccountDelta::new(
+                Chain::Ethereum,
+                shared.clone(),
+                HashMap::from([(Bytes::from(vec![0u8]), Some(Bytes::from(vec![1u8])))]),
+                None,
+                None,
+                ModelChangeType::Update,
+            ),
+        )])
+    }
+
+    /// A pool whose own extractor sends a state delta and writes a linked account takes that
+    /// delta once, with the overrides laid on it, and is not rebuilt from confirmed state.
     #[tokio::test]
     async fn test_apply_deltas_ephemeral_applies_state_deltas_before_linked_overrides() {
         use tycho_common::models::{
-            blockchain::BlockAggregatedChanges, contract::AccountDelta,
-            protocol::ProtocolComponentStateDelta, ChangeType as ModelChangeType,
+            blockchain::BlockAggregatedChanges, protocol::ProtocolComponentStateDelta,
         };
 
         let decoder = TychoStreamDecoder::<BlockHeader>::new(Chain::Ethereum);
@@ -2061,9 +2112,12 @@ mod tests {
             state
                 .contracts_map
                 .insert(shared.clone(), HashSet::from([pool_id.clone()]));
+            state
+                .components
+                .insert(pool_id.clone(), component_of(&pool_id, "with_delta"));
         }
 
-        let mut pending = HashMap::from([(
+        let pending = HashMap::from([(
             "with_delta".to_string(),
             BlockAggregatedChanges {
                 state_deltas: HashMap::from([(
@@ -2078,28 +2132,10 @@ mod tests {
                         created_attributes: HashSet::new(),
                     },
                 )]),
+                account_deltas: shared_account_write(&shared),
                 ..Default::default()
             },
         )]);
-        for index in 0..16 {
-            pending.insert(
-                format!("writes_shared_{index}"),
-                BlockAggregatedChanges {
-                    account_deltas: HashMap::from([(
-                        shared.clone(),
-                        AccountDelta::new(
-                            Chain::Ethereum,
-                            shared.clone(),
-                            HashMap::from([(Bytes::from(vec![0u8]), Some(Bytes::from(vec![1u8])))]),
-                            None,
-                            None,
-                            ModelChangeType::Update,
-                        ),
-                    )]),
-                    ..Default::default()
-                },
-            );
-        }
 
         let update = decoder
             .apply_deltas_ephemeral(&pending, BlockHeader { number: 10, ..Default::default() })
@@ -2107,6 +2143,49 @@ mod tests {
             .unwrap();
 
         assert!(update.states.contains_key(&pool_id));
+    }
+
+    /// An account written by other protocols' extractors leaves a pool of another protocol at
+    /// confirmed state: it is neither rebuilt nor overlaid.
+    #[tokio::test]
+    async fn test_apply_deltas_ephemeral_links_accounts_only_to_the_extractors_own_pools() {
+        use tycho_common::models::blockchain::BlockAggregatedChanges;
+
+        let decoder = TychoStreamDecoder::<BlockHeader>::new(Chain::Ethereum);
+        let pool_id = "0xfluid".to_string();
+        let shared = Bytes::from(vec![6u8; 20]);
+        let mut stored = MockProtocolSim::new();
+        stored.expect_clone_box().times(0);
+        {
+            let mut state = decoder.state.write().await;
+            state
+                .states
+                .insert(pool_id.clone(), Box::new(stored));
+            state
+                .contracts_map
+                .insert(shared.clone(), HashSet::from([pool_id.clone()]));
+            state
+                .components
+                .insert(pool_id.clone(), component_of(&pool_id, "fluid_v1"));
+        }
+        let pending: HashMap<_, _> = (0..16)
+            .map(|index| {
+                (
+                    format!("vm:curve_{index}"),
+                    BlockAggregatedChanges {
+                        account_deltas: shared_account_write(&shared),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+
+        let update = decoder
+            .apply_deltas_ephemeral(&pending, BlockHeader { number: 10, ..Default::default() })
+            .await
+            .unwrap();
+
+        assert!(!update.states.contains_key(&pool_id));
     }
 
     #[test]
