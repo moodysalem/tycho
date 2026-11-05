@@ -269,6 +269,10 @@ state. Fluid and Curve close that gap the same way:
 Reading under the pending block's own number and timestamp matters: anything with on-chain time
 math (Fluid's expanding limits, Curve's ramping `A()`) is wrong under the parent block's clock.
 
+`apply_deltas_ephemeral` applies every extractor's state deltas before any extractor's account
+overrides. A pool linked to an account another extractor wrote then keeps its own delta and only
+takes the overrides on top; it is never rebuilt from confirmed state first.
+
 ## Features
 
 | Feature | Default | Contents |

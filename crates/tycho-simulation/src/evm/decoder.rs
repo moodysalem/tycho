@@ -1134,23 +1134,15 @@ where
         let state_guard = self.state.read().await;
 
         let mut updated_states: HashMap<String, Box<dyn ProtocolSim>> = HashMap::new();
-
+        let mut extractors = Vec::with_capacity(pending_deltas.len());
         for deltas in pending_deltas.values() {
-            let all_balances = Balances {
-                component_balances: deltas
-                    .component_balances
-                    .iter()
-                    .map(|(pool_id, bals)| {
-                        let balances = bals
-                            .iter()
-                            .map(|(t, b)| (t.clone(), b.balance.clone()))
-                            .collect();
-                        (pool_id.clone(), balances)
-                    })
-                    .collect(),
-                account_balances: HashMap::new(),
-            };
+            extractors.push((deltas, Self::pending_balances(deltas)));
+        }
 
+        // Every extractor's state deltas go first. A pool behind an account another extractor
+        // wrote would otherwise be rebuilt from confirmed state before its own delta arrived,
+        // whenever the map happened to yield that other extractor first.
+        for (deltas, all_balances) in &extractors {
             for (id, state_delta) in &deltas.state_deltas {
                 let dto_delta = Self::add_block_info_to_delta(
                     ProtocolStateDelta::from(state_delta.clone()),
@@ -1161,19 +1153,20 @@ where
                     dto_delta,
                     &mut updated_states,
                     &state_guard,
-                    &all_balances,
+                    all_balances,
                 ) {
                     warn!(pool = id, error = %e, "EphemeralDeltaTransitionError");
                 }
             }
-
+        }
+        for (deltas, all_balances) in &extractors {
             if !deltas.account_deltas.is_empty() {
                 Self::apply_pending_overrides(
                     deltas,
                     current_block.as_ref(),
                     &mut updated_states,
                     &state_guard,
-                    &all_balances,
+                    all_balances,
                 )?;
             }
         }
@@ -1190,6 +1183,19 @@ where
         }
 
         Ok(Update::new(block_number, updated_states, HashMap::new()))
+    }
+
+    /// The component balances one extractor's pending changes carry.
+    fn pending_balances(deltas: &BlockAggregatedChanges) -> Balances {
+        let mut component_balances = HashMap::with_capacity(deltas.component_balances.len());
+        for (pool_id, balances) in &deltas.component_balances {
+            let balances = balances
+                .iter()
+                .map(|(token, balance)| (token.clone(), balance.balance.clone()))
+                .collect();
+            component_balances.insert(pool_id.clone(), balances);
+        }
+        Balances { component_balances, account_balances: HashMap::new() }
     }
 
     /// Sets the pending block's account deltas as overrides on every pool linked to a written
@@ -2016,6 +2022,91 @@ mod tests {
                 .unwrap();
             assert!(stored.pending_overrides().is_none(), "confirmed state is never overlaid");
         }
+    }
+
+    /// A pool with a pending state delta takes only that delta, whichever order the extractors
+    /// arrive in, even when other extractors wrote an account linked to it.
+    #[tokio::test]
+    async fn test_apply_deltas_ephemeral_applies_state_deltas_before_linked_overrides() {
+        use tycho_common::models::{
+            blockchain::BlockAggregatedChanges, contract::AccountDelta,
+            protocol::ProtocolComponentStateDelta, ChangeType as ModelChangeType,
+        };
+
+        let decoder = TychoStreamDecoder::<BlockHeader>::new(Chain::Ethereum);
+        let pool_id = "0xpool".to_string();
+        let shared = Bytes::from(vec![5u8; 20]);
+        let mut stored = MockProtocolSim::new();
+        stored
+            .expect_clone_box()
+            .times(1)
+            .returning(|| {
+                let mut clone = MockProtocolSim::new();
+                clone
+                    .expect_delta_transition()
+                    .withf(|delta, _, _| {
+                        delta
+                            .updated_attributes
+                            .contains_key("reserves")
+                    })
+                    .times(1)
+                    .returning(|_, _, _| Ok(()));
+                Box::new(clone)
+            });
+        {
+            let mut state = decoder.state.write().await;
+            state
+                .states
+                .insert(pool_id.clone(), Box::new(stored));
+            state
+                .contracts_map
+                .insert(shared.clone(), HashSet::from([pool_id.clone()]));
+        }
+
+        let mut pending = HashMap::from([(
+            "with_delta".to_string(),
+            BlockAggregatedChanges {
+                state_deltas: HashMap::from([(
+                    pool_id.clone(),
+                    ProtocolComponentStateDelta {
+                        component_id: pool_id.clone(),
+                        updated_attributes: HashMap::from([(
+                            "reserves".to_string(),
+                            Bytes::from(vec![1u8]),
+                        )]),
+                        deleted_attributes: HashSet::new(),
+                        created_attributes: HashSet::new(),
+                    },
+                )]),
+                ..Default::default()
+            },
+        )]);
+        for index in 0..16 {
+            pending.insert(
+                format!("writes_shared_{index}"),
+                BlockAggregatedChanges {
+                    account_deltas: HashMap::from([(
+                        shared.clone(),
+                        AccountDelta::new(
+                            Chain::Ethereum,
+                            shared.clone(),
+                            HashMap::from([(Bytes::from(vec![0u8]), Some(Bytes::from(vec![1u8])))]),
+                            None,
+                            None,
+                            ModelChangeType::Update,
+                        ),
+                    )]),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let update = decoder
+            .apply_deltas_ephemeral(&pending, BlockHeader { number: 10, ..Default::default() })
+            .await
+            .unwrap();
+
+        assert!(update.states.contains_key(&pool_id));
     }
 
     #[test]
